@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+*test.py
+
+# Secrets
+*.json
+*.pem
+*.key
+*.env
+*secret*
+*credentials*
+credentials/
+secrets/
+
+# AWS
+.aws/
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+!terraform.tfvars.example
+
+# Airflow
+airflow.db
+airflow.cfg
+logs/
+airflow-webserver.pid
+standalone_admin_password.txt
+
+# dbt
+dbt_packages/
+target/
+dbt_modules/
+
+# Data
+*.csv
+*.parquet
+*.json
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

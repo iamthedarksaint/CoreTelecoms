@@ -1,0 +1,81 @@
+# CoreTelecoms Pipeline Configuration
+
+pipeline:
+  name: "customer_complaints_etl"
+  description: "Extract, Transform, Load customer complaints data"
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  max_active_runs: 1
+  catchup: false
+  
+# Source configurations
+sources:
+  s3:
+    source_bucket: "{{ var.value.source_bucket }}"
+    customers:
+      enabled: true
+      path: ""
+      file_pattern: "*customer*"
+    call_logs:
+      enabled: true
+      path: ""
+      file_pattern: "*call*"
+    social_media:
+      enabled: true
+      path: ""
+      file_pattern: "*social*"
+  
+  google_sheets:
+    enabled: true
+    spreadsheet_id: "{{ var.value.google_sheet_id }}"
+    worksheet: "agents"
+  
+  postgres:
+    enabled: true
+    schema: "customer_complaints"
+    table_pattern: "web_form_request_*"
+
+# Target configurations
+targets:
+  raw_bucket: "{{ var.value.raw_bucket }}"
+  staging_bucket: "{{ var.value.staging_bucket }}"
+  processed_bucket: "{{ var.value.processed_bucket }}"
+
+# Data warehouse
+warehouse:
+  type: "snowflake"  # or "bigquery", "redshift"
+  database: "{{ var.value.dw_database }}"
+  schema: "RAW"
+
+# Quality checks
+quality_checks:
+  enabled: true
+  min_rows:
+    customers: 1
+    agents: 1
+    call_logs: 0
+    social_media: 0
+    web_forms: 0
+
+# Retry configuration
+retry:
+  retries: 3
+  retry_delay_minutes: 5
+  retry_exponential_backoff: true
+  max_retry_delay_minutes: 60
+
+# Alerting
+alerts:
+  email:
+    enabled: true
+    recipients:
+      - "bojzino128@gmail.com"
+  slack:
+    enabled: false
+    webhook_url: "{{ var.value.slack_webhook }}"
+
+# dbt
+dbt:
+  enabled: true
+  project_dir: "/opt/airflow/dbt"
+  profiles_dir: "/opt/airflow/dbt"
+  target: "dev"

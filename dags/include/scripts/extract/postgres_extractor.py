@@ -233,7 +233,7 @@ def extract_web_forms_from_postgres(
             except Exception as e:
                 logger.warning(f"Error processing table {table}: {str(e)}")
                 continue
-
+        print(f"Returning {len(dataframes)} tables from extraction")  
         return dataframes
         
     except Exception as e:
@@ -291,7 +291,7 @@ def read_table_chunked(
     chunk_size: int = 50000
 ) -> pd.DataFrame:
     """
-    Read a large table in chunks to avoid statement_timeout
+    Read a large table in chunks to avoid timeout
     """
     logger.info(f"Reading {schema}.{table} in chunks of {chunk_size}")
     

@@ -7,8 +7,10 @@ from airflow.sdk import dag, task
 from pendulum import datetime
 from datetime import timedelta
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-# from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
+from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
+from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
 from airflow.hooks.base import BaseHook
+from airflow.providers.standard.operators.empty import EmptyOperator
 import boto3
 
 from include.scripts.utils.logger import setup_logging
@@ -18,21 +20,30 @@ from include.scripts.utils.data_quality import run_quality_checks
 from include.scripts.extract.s3_extractor import (
     extract_customers_from_s3,
     extract_call_logs_from_s3,
-    extract_social_media_from_s3
+    extract_social_media_from_s3,
+    fetch_files
 )
 from include.scripts.extract.google_sheets_extractor import extract_agents_from_google_sheets
 from include.scripts.extract.postgres_extractor import (
     extract_web_forms_from_postgres,
     get_postgres_connection_string
 )
-from include.scripts.load.s3_loader import write_to_raw_layer, save_extraction_metadata
+from include.scripts.load.s3_loader import write_to_raw_layer, save_extraction_metadata, write_to_static_layer, ingest_to_s3
+from include.scripts.load.warehouse_loader import get_database_setup_sql, get_agents_table_ddl, get_call_logs_table_ddl, get_customers_table_ddl, get_social_media_table_ddl, get_web_forms_table_ddl
 from datetime import datetime
 from typing import Dict, Optional, List
 import logging
 import pandas as pd
+import json
 
 logger = logging.getLogger(__name__)
 logger = setup_logging("main_extract", log_level="INFO")
+
+LOCAL_CUSTOMERS_DIR = "/opt/airflow/data/customers"
+LOCAL_CALL_LOGS_DIR = "/opt/airflow/data/call_logs"
+LOCAL_SOCIAL_DIR = "/opt/airflow/data/social_media"
+LOCAL_AGENTS = "/opt/airflow/data/agents"
+DEST_BUCKET = "coretelecoms-raw-data-dev"
 
 default_args = {
     'owner': 'airflow',
@@ -43,7 +54,7 @@ default_args = {
 @dag(
     dag_id="customer_complaints_pipeline",
     start_date=datetime(2025, 11, 20),
-    end_date=datetime(2025, 11, 23),
+    end_date=datetime(2025, 12, 23),
     max_active_runs=1,
     catchup=True,
     schedule="@daily",
@@ -53,44 +64,56 @@ default_args = {
 
 def run_pipeline():
 
-    
-    # @task
-    # def get_sessions():
-    #     """Get boto3 sessions for source and destination AWS accounts."""
-    #     source_conn = BaseHook.get_connection('aws_source')
-    #     dest_conn = BaseHook.get_connection('aws_dest')
+    aws_dest = BaseHook.get_connection('aws_dest')
 
-    #     source_session = boto3.Session(
-    #     aws_access_key_id=source_conn.login,
-    #     aws_secret_access_key=source_conn.password
-    #     )
+    setup_database = SQLExecuteQueryOperator(
+        task_id='setup_database',
+        conn_id='snowflake_default',
+        sql=get_database_setup_sql()
+    )
 
-    #     dest_session = boto3.Session(
-    #     aws_access_key_id=dest_conn.login,
-    #     aws_secret_access_key=dest_conn.password
-    #     )
-    #     return {
-    #         'source_session': source_session,
-    #         'dest_session': dest_session
-    #     }
+    create_agents_table = SQLExecuteQueryOperator(
+        task_id='create_agents_table',
+        conn_id='snowflake_default',
+        sql=get_agents_table_ddl()
+    )
+
+    create_customers_table = SQLExecuteQueryOperator(
+        task_id='create_customers_table',
+        conn_id='snowflake_default',
+        sql=get_customers_table_ddl()
+    )
+
+    create_call_logs_table = SQLExecuteQueryOperator(
+        task_id='create_call_logs_table',
+        conn_id='snowflake_default',
+        sql=get_call_logs_table_ddl()
+    )
+
+    create_social_media_table = SQLExecuteQueryOperator(
+        task_id='create_social_media_table',
+        conn_id='snowflake_default',
+        sql=get_social_media_table_ddl()
+    )
+
+    create_web_forms_table = SQLExecuteQueryOperator(
+        task_id='create_web_forms_table',
+        conn_id='snowflake_default',
+        sql=get_web_forms_table_ddl()
+    )
 
     @task
     def extract_agent() -> pd.DataFrame:
-
-        dest_conn = BaseHook.get_connection('aws_dest')
-        session = boto3.Session(
-            aws_access_key_id=dest_conn.login,
-            aws_secret_access_key=dest_conn.password,
-            region_name="eu-north-1"
-        )
-        credentials = get_parameters_by_path("/coretelecoms/hassan/", boto3_session=session)
-        credentials = parse_json_parameters(credentials, ["google-sheets"])
+        credential_path = "/opt/airflow/dags/service_account_key.json"
+        with open(credential_path, 'r') as f:
+            credentials = json.load(f)
         sheets_config = get_google_sheets_config()
         df = extract_agents_from_google_sheets(
-            credentials_dict=credentials["google-sheets"],
+            credentials_dict=credentials,
             spreadsheet_id=sheets_config['spreadsheet_id'],
             worksheet_name='agents'
         )
+        
         logger.info(f"Extracted {len(df)} agents")
         return df
 
@@ -108,7 +131,7 @@ def run_pipeline():
         if not quality_results['all_passed']:
             logger.warning("Agent quality checks failed")
 
-        write_to_raw_layer(df, bucket, 'agents', ds, session)
+        write_to_static_layer(df, bucket, 'agents', ds, session)
         save_extraction_metadata(bucket, 'agents', {
             'source': 'agents',
             'row_count': len(df),
@@ -119,80 +142,52 @@ def run_pipeline():
         return {'source': 'agents', 'rows': len(df), 'status': 'success'}
 
     @task
-    def extract_customer(source_bucket: str) -> pd.DataFrame:
-        conn = BaseHook.get_connection('aws_source')
-        session = boto3.Session(
-        aws_access_key_id=conn.login,
-        aws_secret_access_key=conn.password,
-        region_name="eu-north-1"
-        )
-        df = extract_customers_from_s3(bucket=source_bucket, boto3_session=session)
-        logger.info(f"Extracted {len(df)} customers")
-        return df
+    def extract_customer() -> pd.DataFrame:
+        files = fetch_files(LOCAL_CUSTOMERS_DIR)
+        logger.info(f"Extracted {len(files)} customers")
+        return files
 
     @task
-    def load_customer(bucket: str, df: pd.DataFrame, ds: str =  None) -> dict:
-        checks = {'min_rows': 1, 'required_columns': ['customer_id']}
-        results = run_quality_checks(df, checks)
-        conn = BaseHook.get_connection('aws_dest')
-        session = boto3.Session(
-        aws_access_key_id=conn.login,
-        aws_secret_access_key=conn.password,
-        region_name="eu-north-1"
-        )
-        write_to_raw_layer(df, bucket, 'customers', ds, session)
-        save_extraction_metadata(bucket, 'customers', {
-            'row_count': len(df), 'quality_checks': results, 'status': 'success'
-        }, ds, session)
-        return {'source': 'customers', 'rows': len(df), 'status': 'success'}
+    def load_customer(files: List):
+        # checks = {'min_rows': 1, 'required_columns': ['customer_id']}
+        # results = run_quality_checks(df, checks)
+        # write_to_raw_layer(df, bucket, 'customers', ds, session)
+        # save_extraction_metadata(bucket, 'customers', {
+        #     'row_count': len(df), 'quality_checks': results, 'status': 'success'
+        # }, ds, session)
+        # return {'source': 'customers', 'rows': len(df), 'status': 'success'}
+        uploaded_path = ingest_to_s3(files, DEST_BUCKET, "customers", incremental=False)
+        return uploaded_path
 
     @task
-    def extract_call_logs(source_bucket: str) -> pd.DataFrame:
-        conn = BaseHook.get_connection('aws_source')
-        session = boto3.Session(
-        aws_access_key_id=conn.login,
-        aws_secret_access_key=conn.password,
-        region_name="eu-north-1"
-        )
-        return extract_call_logs_from_s3(bucket=source_bucket, boto3_session=session)
+    def extract_call_logs():
+        files = fetch_files(LOCAL_CALL_LOGS_DIR)
+        return files
 
     @task
-    def load_call_logs(bucket: str, df: pd.DataFrame, ds: str = None) -> dict:
-        conn = BaseHook.get_connection('aws_dest')
-        session = boto3.Session(
-        aws_access_key_id=conn.login,
-        aws_secret_access_key=conn.password,
-        region_name="eu-north-1"
-        )
-        write_to_raw_layer(df, bucket, 'call_logs', ds, session)
-        save_extraction_metadata(bucket, 'call_logs', {
-            'row_count': len(df), 'quality_checks': {'all_passed': True}, 'status': 'success'
-        }, ds, session)
-        return {'source': 'call_logs', 'rows': len(df), 'status': 'success'}
+    def load_call_logs(files: List, ds: str):
+        # write_to_raw_layer(df, bucket, 'call_logs', ds, session)
+        # save_extraction_metadata(bucket, 'call_logs', {
+        #     'row_count': len(df), 'quality_checks': {'all_passed': True}, 'status': 'success'
+        # }, ds, session)
+        # return {'source': 'call_logs', 'rows': len(df), 'status': 'success'}
+        uploaded_path = ingest_to_s3(files, DEST_BUCKET, "call_logs", execution_date=ds, incremental=True)
+        return uploaded_path
 
     @task
-    def extract_social_media(source_bucket: str) -> pd.DataFrame:
-        conn = BaseHook.get_connection('aws_source')
-        session = boto3.Session(
-        aws_access_key_id=conn.login,
-        aws_secret_access_key=conn.password,
-        region_name="eu-north-1"
-        )
-        return extract_social_media_from_s3(bucket=source_bucket, boto3_session=session)
+    def extract_social_media() -> pd.DataFrame:
+        files = fetch_files(LOCAL_SOCIAL_DIR)
+        return files
 
     @task
-    def load_social_media(bucket: str, df: pd.DataFrame, ds: str = None) -> dict:
-        conn = BaseHook.get_connection('aws_dest')
-        session = boto3.Session(
-        aws_access_key_id=conn.login,
-        aws_secret_access_key=conn.password,
-        region_name="eu-north-1"
-        )
-        write_to_raw_layer(df, bucket, 'social_media', ds, session)
-        save_extraction_metadata(bucket, 'social_media', {
-            'row_count': len(df), 'quality_checks': {'all_passed': True}, 'status': 'success'
-        }, ds, session)
-        return {'source': 'social_media', 'rows': len(df), 'status': 'success'}
+    def load_social_media(files: List, ds: str):
+        # write_to_raw_layer(df, bucket, 'social_media', ds, session)
+        # save_extraction_metadata(bucket, 'social_media', {
+        #     'row_count': len(df), 'quality_checks': {'all_passed': True}, 'status': 'success'
+        # }, ds, session)
+        # return {'source': 'social_media', 'rows': len(df), 'status': 'success'}
+        uploaded_path = ingest_to_s3(files, DEST_BUCKET, "social_media", execution_date=ds, incremental=True)
+        return uploaded_path
 
     @task
     def extract_web_forms() -> List[Dict]:
@@ -243,50 +238,156 @@ def run_pipeline():
         return {'source': 'web_forms', 'rows': total}
 
 
-    @task
-    def load_to_snowflake(ds: str):
-        hook = SnowflakeHook(snowflake_conn_id='snowflake_default')
-        conn = hook.get_conn()
-        cursor = conn.cursor()
-        bucket = get_aws_config()['raw_bucket']
-        s3_path = f"s3://{bucket}/raw/{ds}/"
-        tables = ['agents', 'customers', 'call_logs', 'social_media', 'web_forms']
-        for table in tables:
-            cursor.execute(f"""
-                COPY INTO CORETELECOMS.RAW.{table}
-                FROM '{s3_path}{table}.parquet'
-                FILE_FORMAT = (TYPE = 'PARQUET')
-                MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE;
-            """)
-        conn.commit()
-        cursor.close()
-        conn.close()
-        logger.info("Loaded all tables to Snowflake")
+    
+    aws_dest = BaseHook.get_connection('aws_dest')
+
+    load_agents_to_snowflake = SQLExecuteQueryOperator(
+    task_id='load_agents_to_snowflake',
+    conn_id='snowflake_default',
+    sql=f"""
+    USE DATABASE CORETELECOMS;
+    USE SCHEMA RAW;
+
+    COPY INTO agents
+    FROM 's3://{DEST_BUCKET}/agents/agents.parquet'
+    CREDENTIALS = (
+        AWS_KEY_ID = '{aws_dest.login}'
+        AWS_SECRET_KEY = '{aws_dest.password}'
+    )
+    FILE_FORMAT = (TYPE = 'PARQUET')
+    MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+    PURGE = FALSE;
+    """
+    )
+
+    load_customers_to_snowflake = SQLExecuteQueryOperator(
+    task_id='load_customers_to_snowflake',
+    conn_id='snowflake_default',
+    sql=f"""
+    USE DATABASE CORETELECOMS;
+    USE SCHEMA RAW;
+    
+    COPY INTO customers
+    FROM 's3://{DEST_BUCKET}/customers/data.parquet'
+    CREDENTIALS = (
+        AWS_KEY_ID = '{aws_dest.login}'
+        AWS_SECRET_KEY = '{aws_dest.password}'
+    )
+    FILE_FORMAT = (TYPE = 'PARQUET')
+    MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+    PURGE = FALSE;
+    """
+)
+
+    load_call_logs_to_snowflake = SQLExecuteQueryOperator(
+        task_id='load_call_logs_to_snowflake',
+        conn_id='snowflake_default',
+        sql=f"""
+        USE DATABASE CORETELECOMS;
+        USE SCHEMA RAW;
+        
+        COPY INTO call_logs
+        FROM 's3://{DEST_BUCKET}/call_logs/year={{{{ logical_date.year }}}}/month={{{{ logical_date.strftime('%m') }}}}/day={{{{ logical_date.strftime('%d') }}}}/'
+        CREDENTIALS = (
+            AWS_KEY_ID = '{aws_dest.login}'
+            AWS_SECRET_KEY = '{aws_dest.password}'
+        )
+        FILE_FORMAT = (TYPE = 'PARQUET')
+        MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+        PURGE = FALSE;
+        """
+    )
+
+    load_social_media_to_snowflake = SQLExecuteQueryOperator(
+    task_id='load_social_media_to_snowflake',
+    conn_id='snowflake_default',
+    sql=f"""
+    USE DATABASE CORETELECOMS;
+    USE SCHEMA RAW;
+    
+    COPY INTO social_media
+    FROM 's3://{DEST_BUCKET}/social_media/year={{{{ logical_date.year }}}}/month={{{{ logical_date.strftime('%m') }}}}/day={{{{ logical_date.strftime('%d') }}}}/'
+    CREDENTIALS = (
+        AWS_KEY_ID = '{aws_dest.login}'
+        AWS_SECRET_KEY = '{aws_dest.password}'
+    )
+    FILE_FORMAT = (TYPE = 'PARQUET')
+    MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+    PURGE = FALSE;
+    """
+)
+    start = EmptyOperator(task_id='start')
+
+    end = EmptyOperator(task_id='end')
+
+
 
 
 
     aws_config = get_aws_config()
     raw_bucket = aws_config['raw_bucket']
-    source_bucket = aws_config['source_bucket']
+    # source_bucket = aws_config['source_bucket']
 
 
     agent_df = extract_agent()
+    customer_files = extract_customer()
+    call_log_files = extract_call_logs()
+    social_media_files = extract_social_media()
+    # cust_df = extract_customer(source_bucket)
+    # call_df = extract_call_logs(source_bucket)
+    # sm_df = extract_social_media(source_bucket)
+
+
     agent_loaded = load_agent(raw_bucket, agent_df)
+    customer_loaded = load_customer(customer_files)
+    call_log_loaded = load_call_logs(call_log_files)
+    social_media_loaded = load_social_media(social_media_files)
+    # cust_loaded = load_customer(raw_bucket, cust_df)
+    # # call_loaded = load_call_logs(raw_bucket, call_df)
+    # sm_loaded = load_social_media(raw_bucket, sm_df)
+    # web_data = extract_web_forms()
+    # web_loaded = load_web_forms(raw_bucket, web_data)
 
-    cust_df = extract_customer(source_bucket)
-    cust_loaded = load_customer(raw_bucket, cust_df)
+    # sf_task = load_to_snowflake()
+    # [customer_loaded, call_log_loaded, social_media_loaded, web_loaded] >> sf_task
 
-    call_df = extract_call_logs(source_bucket)
-    call_loaded = load_call_logs(raw_bucket, call_df)
+    start >> setup_database
 
-    sm_df = extract_social_media(source_bucket)
-    sm_loaded = load_social_media(raw_bucket, sm_df)
+    setup_database >> [
+        create_agents_table,
+        create_customers_table,
+        create_call_logs_table,
+        create_social_media_table
+    ]
 
-    web_data = extract_web_forms()
-    web_loaded = load_web_forms(raw_bucket, web_data)
+    tables_created = EmptyOperator(task_id='tables_created')
 
-    sf_task = load_to_snowflake()
+    [
+        create_agents_table,
+        create_customers_table,
+        create_call_logs_table,
+        create_social_media_table
+    ] >> tables_created
+    
+    tables_created >> [agent_df, customer_files, call_log_files, social_media_files]
 
-    [agent_loaded, cust_loaded, call_loaded, sm_loaded, web_loaded] >> sf_task
+    agent_df >> agent_loaded
+    customer_files >> customer_loaded
+    call_log_files >> call_log_loaded
+    social_media_files >> social_media_loaded
 
+    agent_loaded >> load_agents_to_snowflake
+    customer_loaded >> load_customers_to_snowflake
+    call_log_loaded >> load_call_logs_to_snowflake
+    social_media_loaded >> load_social_media_to_snowflake
+
+    [
+        load_agents_to_snowflake,
+        load_customers_to_snowflake,
+        load_call_logs_to_snowflake,
+        load_social_media_to_snowflake
+    ] >> end
+
+
+ 
 dag_instance = run_pipeline()

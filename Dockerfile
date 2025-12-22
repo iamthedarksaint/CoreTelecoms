@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir \
     google-auth==2.29.0 \
     google-auth-oauthlib==1.2.0 \
     gspread==6.0.0 \
-    apache-airflow-providers-amazon>=2.1.0 \
+    apache-airflow-providers-amazon>=9.13.0 \
     apache-airflow-providers-snowflake>=5.7.0 \
     snowflake-connector-python \
     psycopg2-binary \

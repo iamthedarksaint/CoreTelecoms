@@ -102,7 +102,7 @@ def put_parameter_in_ssm(
 def get_parameters_by_path(
         path: str, 
         region_name: str = "eu-north-1",
-        profile_name: str | None = None
+        boto3_session: Optional[boto3.Session] = None
         ) -> Dict[str, str]:
     """
     Get all parameters under a path from SSM Parameter Store
@@ -115,8 +115,13 @@ def get_parameters_by_path(
         Dictionary of parameter names and values
     """
     try:
-        session = get_boto3_session(region_name, profile_name=profile_name)
+        if boto3_session is None:
+            session = boto3.Session(region_name=region_name)
+        else:
+            session = boto3_session
         client = session.client('ssm')
+        # session = get_boto3_session(region_name, profile_name=profile_name)
+        # client = session.client('ssm')
         
         parameters = {}
         paginator = client.get_paginator('get_parameters_by_path')

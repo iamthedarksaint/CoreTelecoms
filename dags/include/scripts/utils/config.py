@@ -1,6 +1,7 @@
 import os
 from typing import Dict, Optional
 from dotenv import load_dotenv
+import pandas as pd
 
 load_dotenv()
 
@@ -93,3 +94,13 @@ def get_db_connection_string() -> str:
     """
     db_config = get_database_config()
     return f"postgresql://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}"
+
+
+def csv_to_parquet(csv_path: str, parquet_path: str):
+    df = pd.read_csv(csv_path)
+    df.columns = (
+        df.columns.str.lower()
+        .str.strip()
+        .str.replace(' ', '_')
+    )
+    df.to_parquet(parquet_path, engine="pyarrow", index=False)

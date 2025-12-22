@@ -10,6 +10,9 @@ ENV/
 *.egg-info/
 .pytest_cache/
 *test.py
+*data
+*service_account_key
+*main.py
 
 # Secrets
 *.json

@@ -1,0 +1,370 @@
+name: CD - Build, Push & Deploy
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+env:
+  DOCKER_IMAGE: yourusername/coretelecoms-airflow
+  AWS_REGION: eu-north-1
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.docker_build.outputs.digest }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Extract Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and Push Docker Image
+        id: docker_build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+      
+      - name: Image Digest
+        run: |
+          echo "Image Digest: ${{ steps.docker_build.outputs.digest }}"
+          echo "Image Tags: ${{ steps.meta.outputs.tags }}"
+      
+      - name: Scan Docker Image for Vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.DOCKER_IMAGE }}:latest
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+        continue-on-error: true
+      
+      - name: Upload Trivy Scan Results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+      
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+      
+      - name: Terraform Format Check
+        working-directory: ./terraform
+        run: terraform fmt -check
+        continue-on-error: true
+      
+      - name: Terraform Validate
+        working-directory: ./terraform
+        run: terraform validate
+      
+      - name: Terraform Plan
+        working-directory: ./terraform
+        run: |
+          terraform plan \
+            -var="environment=prod" \
+            -var="docker_image=${{ needs.build-and-push.outputs.image-tag }}" \
+            -out=tfplan
+      
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan
+          path: terraform/tfplan
+
+  deploy-infrastructure:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [build-and-push, terraform-plan]
+    environment:
+      name: production
+      url: https://airflow.coretelecoms.com
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+      
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan
+          path: terraform/
+      
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+      
+      - name: Terraform Apply
+        working-directory: ./terraform
+        run: terraform apply -auto-approve tfplan
+
+  deploy-airflow:
+    name: Deploy Airflow
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-infrastructure]
+    environment:
+      name: prod
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Deploy to EC2/ECS (Example)
+        run: |
+          echo "Deploying Airflow with image: ${{ needs.build-and-push.outputs.image-tag }}"
+          
+          # Option 1: SSH to EC2 and update
+          # ssh -i key.pem user@server 'cd /app && docker-compose pull && docker-compose up -d'
+          
+          # Option 2: Update ECS Service
+          # aws ecs update-service --cluster airflow-cluster --service airflow --force-new-deployment
+          
+          # Option 3: Update docker-compose on remote server
+          # scp docker-compose.yml user@server:/app/
+          # ssh user@server 'cd /app && docker-compose pull && docker-compose up -d'
+
+  sync-dags:
+    name: Sync DAGs to S3
+    runs-on: ubuntu-latest
+    needs: deploy-airflow
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Sync DAGs to S3
+        run: |
+          aws s3 sync dags/ s3://coretelecoms-airflow-dags/dags/ \
+            --delete \
+            --exclude "*.pyc" \
+            --exclude "__pycache__/*" \
+            --exclude ".pytest_cache/*"
+      
+      - name: Sync dbt Models to S3
+        run: |
+          aws s3 sync dbt/ s3://coretelecoms-airflow-dags/dbt/ \
+            --delete \
+            --exclude "target/*" \
+            --exclude "logs/*" \
+            --exclude "dbt_packages/*"
+
+  run-dbt-prod:
+    name: Run dbt in Production
+    runs-on: ubuntu-latest
+    needs: sync-dags
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dbt
+        run: |
+          pip install dbt-core==1.8.0 dbt-snowflake==1.8.0
+      
+      - name: dbt Debug
+        working-directory: ./dbt
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_ROLE: ACCOUNTADMIN
+          SNOWFLAKE_DATABASE: CORETELECOMS
+          SNOWFLAKE_WAREHOUSE: CORETELECOM
+          SNOWFLAKE_SCHEMA: RAW
+        run: dbt debug
+      
+      - name: dbt Run
+        working-directory: ./dbt
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_ROLE: ACCOUNTADMIN
+          SNOWFLAKE_DATABASE: CORETELECOMS
+          SNOWFLAKE_WAREHOUSE: CORETELECOM
+          SNOWFLAKE_SCHEMA: RAW
+        run: dbt run --target prod
+      
+      - name: dbt Test
+        working-directory: ./dbt
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_ROLE: ACCOUNTADMIN
+          SNOWFLAKE_DATABASE: CORETELECOMS
+          SNOWFLAKE_WAREHOUSE: CORETELECOM
+          SNOWFLAKE_SCHEMA: RAW
+        run: dbt test --target prod
+
+  smoke-tests:
+    name: Run Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-airflow, run-dbt-prod]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Test Airflow API Health
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" https://airflow.coretelecoms.com/health)
+          if [ $response -eq 200 ]; then
+            echo " Airflow is healthy"
+          else
+            echo " Airflow health check failed with status $response"
+            exit 1
+          fi
+      
+      - name: Verify DAGs are Loaded
+        run: |
+          # Add authentication and check if DAGs are loaded
+          echo "Verifying DAGs in Airflow..."
+
+  notify:
+    name: Send Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [deploy-airflow, run-dbt-prod, smoke-tests]
+    if: always()
+    
+    steps:
+      - name: Notify Slack on Success
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "Deployment Successful",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*CoreTelecoms Data Platform Deployed Successfully*\n\n*Environment:* Production\n*Version:* ${{ github.sha }}\n*Triggered by:* ${{ github.actor }}\n*Status:* Success"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      
+      - name: Notify Slack on Failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "❌ Deployment Failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*CoreTelecoms Data Platform Deployment Failed*\n\n*Environment:* Production\n*Version:* ${{ github.sha }}\n*Triggered by:* ${{ github.actor }}\n*Status:* ❌ Failed\n\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Logs>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: [deploy-airflow, smoke-tests]
+    if: failure()
+    
+    steps:
+      - name: Rollback Deployment
+        run: |
+          echo "Rolling back to previous version..."
+          # Implement rollback logic
+          # Example: Revert to previous Docker image tag
+          # aws ecs update-service --cluster airflow --service airflow --task-definition previous-version

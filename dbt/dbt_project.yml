@@ -13,7 +13,11 @@ clean-targets:
 
 models:
   coretelecoms:
-    staging:
-      +materialized: view
-    marts:
+
+    silver:
+      +schema: silver
+      +materialized: table
+
+    gold:
+      +schema: gold 
       +materialized: table

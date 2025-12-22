@@ -11,11 +11,12 @@ from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
 from airflow.hooks.base import BaseHook
 from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.providers.standard.operators.bash import BashOperator
 import boto3
 
 from include.scripts.utils.logger import setup_logging
 from include.scripts.utils.config import get_aws_config, get_google_sheets_config
-from include.scripts.utils.aws_utils import get_parameters_by_path, parse_json_parameters
+from include.scripts.utils.aws_utils import get_parameters_by_path
 from include.scripts.utils.data_quality import run_quality_checks
 from include.scripts.extract.s3_extractor import (
     extract_customers_from_s3,
@@ -316,6 +317,16 @@ def run_pipeline():
     PURGE = FALSE;
     """
 )
+    dbt_run = BashOperator(
+    task_id='dbt_run',
+    bash_command='cd /opt/airflow/dbt && dbt run --profiles-dir /opt/airflow/dbt',
+    )
+
+    dbt_test = BashOperator(
+    task_id='dbt_test',
+    bash_command='cd /opt/airflow/dbt && dbt test --profiles-dir /opt/airflow/dbt',
+    )
+
     start = EmptyOperator(task_id='start')
 
     end = EmptyOperator(task_id='end')
@@ -333,23 +344,12 @@ def run_pipeline():
     customer_files = extract_customer()
     call_log_files = extract_call_logs()
     social_media_files = extract_social_media()
-    # cust_df = extract_customer(source_bucket)
-    # call_df = extract_call_logs(source_bucket)
-    # sm_df = extract_social_media(source_bucket)
 
 
     agent_loaded = load_agent(raw_bucket, agent_df)
     customer_loaded = load_customer(customer_files)
     call_log_loaded = load_call_logs(call_log_files)
     social_media_loaded = load_social_media(social_media_files)
-    # cust_loaded = load_customer(raw_bucket, cust_df)
-    # # call_loaded = load_call_logs(raw_bucket, call_df)
-    # sm_loaded = load_social_media(raw_bucket, sm_df)
-    # web_data = extract_web_forms()
-    # web_loaded = load_web_forms(raw_bucket, web_data)
-
-    # sf_task = load_to_snowflake()
-    # [customer_loaded, call_log_loaded, social_media_loaded, web_loaded] >> sf_task
 
     start >> setup_database
 
@@ -386,7 +386,7 @@ def run_pipeline():
         load_customers_to_snowflake,
         load_call_logs_to_snowflake,
         load_social_media_to_snowflake
-    ] >> end
+    ] >> dbt_run >> dbt_test >> end
 
 
  

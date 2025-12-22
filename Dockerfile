@@ -17,4 +17,7 @@ RUN pip install --no-cache-dir \
     pyyaml==6.0.1\
     pandas \
     numpy \
-    awswrangler
+    awswrangler\
+    pyarrow
+
+

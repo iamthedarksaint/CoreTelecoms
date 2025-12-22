@@ -6,3 +6,6 @@ sources:
     schema: RAW
     tables:
       - name: agents
+      - name: customers
+      - name: call_logs
+      - name: social_media
